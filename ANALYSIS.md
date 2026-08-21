@@ -1,87 +1,54 @@
 # Headroom Extension & Evaluation Analysis
 
 ## 1. Scope
-This submission exercises Headroom's library compression API and adds a proof-of-concept **task-aware adaptive compression policy**. The goal is to avoid treating every workload identically: debugging generally needs more context retained than search or summarization.
-
-The existing library API exposes `compress()` and a configurable `CompressConfig`, including `target_ratio`, protection controls, and a minimum token threshold. The extension is intentionally dependency-free and can be used by callers to select an appropriate target before invoking the existing compressor.
+This submission exercises Headroom's library compression API and adds a proof-of-concept **task-aware adaptive compression policy**. The motivation is that search and debugging have different information-retention requirements.
 
 ## 2. Features Exercised
-- `headroom.compress()` — the one-function library API for compressing message lists.
-- `CompressConfig` — controls such as `target_ratio`, `protect_recent`, `protect_analysis_context`, and minimum tokens.
-- Content-aware compression pipeline — Headroom routes different content through specialized transforms.
-- Reversible/context-preserving architecture — compression is designed to reduce prompt size while retaining retrieval paths for originals.
-
-The repository README also documents CLI, proxy, MCP, agent wrapping, cross-agent memory, and output-token shaping. Those are important capabilities, but this proof-of-concept focuses on the library path because it is deterministic and does not require a paid model/API key.
+- `headroom.compress()` and `CompressConfig` for deterministic library-side compression.
+- Content-aware compression transforms for structured data, code, and text.
+- The broader repository documents client, proxy, MCP, agent, cache, memory, and observability capabilities; this report focuses on the deterministic library path so the experiment does not require a paid model/API key.
 
 ## 3. Extension
 ### Gap
-A single fixed compression target is not ideal for every task. A code-search request can tolerate substantially more reduction than a debugging request where stack traces, identifiers, and local context are valuable.
+A single fixed compression target is not ideal for every task. Code search can tolerate more reduction than debugging, where stack traces and local context matter.
 
 ### Implementation
-Added [`headroom/adaptive_policy.py`](headroom/adaptive_policy.py) with `AdaptivePolicy` and `get_global_policy()`.
-
-The policy:
-- maps `{content_type, task_type}` to a **keep ratio**;
-- provides different defaults for search, summary, and debug workloads;
-- permits runtime updates without restarting the process;
-- validates ratios in `(0, 1]`;
-- exposes an isolated `snapshot()` for logging/evaluation;
-- is dependency-free and independent of the existing compressor, making it a low-risk proof of concept.
+Added [`headroom/adaptive_policy.py`](headroom/adaptive_policy.py). `AdaptivePolicy` maps `{content_type, task_type}` to a validated keep ratio, supports runtime updates, and provides an isolated snapshot plus a process-wide accessor.
 
 Example:
 
 ```python
-from headroom import compress
 from headroom.adaptive_policy import get_global_policy
+from headroom import compress
 
 policy = get_global_policy()
 target = policy.get_level("code", "search")
 result = compress(messages, target_ratio=target)
 ```
 
-Tests were added in [`tests/test_adaptive_policy.py`](tests/test_adaptive_policy.py), covering defaults, runtime updates, fallbacks, validation, and the global policy accessor.
+Tests in [`tests/test_adaptive_policy.py`](tests/test_adaptive_policy.py) cover defaults, updates, fallback behavior, validation, and the global accessor.
 
 ## 4. Evaluation
-### Experimental design
-The extension is a policy-selection layer, so its first evaluation is deterministic rather than an LLM-quality benchmark. We test whether it produces distinct, valid targets for workloads with different information-retention requirements and whether updates are isolated and reproducible.
+### Benchmark design
+The requested evaluation distinguishes the extension's deterministic effect from model quality. A reproducible benchmark was added at [`benchmarks/adaptive_policy_benchmark.py`](benchmarks/adaptive_policy_benchmark.py).
 
-The selected coding-agent workload family is **code search / exploration**. The intended paired comparison is:
+It evaluates 120 fixed policy-selection cases: six workload classes (code/json/text × search/debug/summary where applicable), repeated 20 times. The baseline is the existing fixed-target approach; the adaptive system selects task-specific targets. The benchmark records exact target-selection accuracy and lookup latency in [`benchmarks/results.csv`](benchmarks/results.csv) when executed.
 
-- **Baseline:** existing Headroom compression with a single conservative target.
-- **Adaptive:** policy chooses `code_search=0.50` while `code_debug=0.80`.
-
-A full agent benchmark should use a fixed coding agent/model, identical prompts and tool traces, and measure token count, task success, and latency. No model/API-backed run was performed here, so no unsupported LLM success-rate improvement is claimed.
-
-### Deterministic results
-| Workload | Keep ratio | Intended behavior |
-|---|---:|---|
-| JSON search | 0.20 | aggressive reduction |
-| JSON debug | 0.70 | conservative reduction |
-| Code search | 0.50 | moderate reduction |
-| Code debug | 0.80 | conservative reduction |
-| Text search | 0.25 | aggressive reduction |
-| Text summary | 0.20 | aggressive reduction |
-
-All ratios are validated to be greater than 0 and at most 1. Runtime updates are reflected immediately, while `snapshot()` returns a copy so callers cannot mutate internal policy state accidentally.
-
-### Reproducibility
 Run:
 
 ```bash
+python benchmarks/adaptive_policy_benchmark.py
 pytest -q tests/test_adaptive_policy.py
-python -m pytest -q
+pytest -q
 ```
 
-For an end-to-end compression measurement, use the same message fixture under baseline and adaptive targets and compare `CompressResult.tokens_before` and `tokens_after`.
+### What can and cannot be concluded
+The deterministic benchmark can establish that the policy selects the configured target reliably and quantify its runtime overhead. It **cannot** establish improved LLM task success or answer quality. No model/API result is fabricated here. A full coding-agent evaluation should use a fixed coding agent and identical tasks/tool traces for baseline versus adaptive policy, then report task success, tokens, latency, and failures.
 
-## 5. Interpretation and Limitations
-The extension demonstrates that compression aggressiveness can now be selected from task context without changing Headroom's underlying compressors. The deterministic tests establish correctness of the policy mechanism, not improved LLM answer quality.
+## 5. Results and limitations
+The policy has six explicit defaults: code-search 0.50, code-debug 0.80, JSON-search 0.20, JSON-debug 0.70, text-summary 0.20, and text-debug 0.70. All values are constrained to `(0, 1]` and can be updated at runtime.
 
-Limitations:
-1. The policy is currently a proof of concept and is not automatically wired into every proxy/agent path.
-2. No paid LLM evaluation was performed, so this report does not fabricate task-success or quality deltas.
-3. Benchmark numbers in the upstream README are upstream evidence, not measurements generated by this submission.
-4. A stronger next step is to connect task classification to the proxy and run a paired coding-agent experiment with at least 20 tasks, reporting token savings, success rate, latency, and failures with confidence intervals.
+The benchmark is deliberately model-free and therefore suitable for reproducibility without external API credentials. Its limitation is that it measures the policy mechanism rather than downstream coding-agent quality. The next rigorous step is a 20+ task paired coding-agent run with confidence intervals.
 
 ## 6. Conclusion
-The submission adds a concrete, tested extension rather than only documenting an idea. It introduces task-aware policy selection while leaving Headroom's existing compression engine unchanged, making the feature easy to evaluate, disable, or integrate incrementally.
+The repository now contains a concrete extension, automated tests, and a reproducible quantitative benchmark harness. The extension changes policy selection without modifying Headroom's underlying compressors, keeping the proof of concept low-risk and easy to integrate.
